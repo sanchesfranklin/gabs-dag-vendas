@@ -1,0 +1,4 @@
+# Arquivos deste produto que NÃO são DAGs (o Airflow não precisa analisá-los)
+jobs.py
+pipeline.py
+schema_tables.py
