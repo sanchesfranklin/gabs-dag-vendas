@@ -1,12 +1,19 @@
-"""Etapas do pipeline de vendas.
+"""Etapas do pipeline de vendas, em modo incremental.
 
-Cada função é uma etapa independente: abre a própria sessão Spark, lê da
-camada anterior, grava na seguinte e fecha a sessão. Rodar a mesma etapa duas
-vezes produz o mesmo resultado (idempotência), o que permite repetir uma
-tarefa que falhou sem medo.
+Cada execução processa UM dia de referência (os pedidos criados naquele dia).
+Todas as etapas recebem esse dia e só tocam a fatia correspondente:
+
+    landing  grava em  s3a://landing/vendas/pedidos/dt_referencia=AAAA-MM-DD/
+    bronze   substitui DT_REFERENCIA = dia
+    silver   substitui DT_REFERENCIA = dia
+    gold     substitui DT_PEDIDO     = dia
+
+Rodar o mesmo dia de novo substitui exatamente a mesma fatia, com os mesmos
+dados de origem. É isso que torna o pipeline idempotente.
 """
 
 import os
+from datetime import date, timedelta
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -14,42 +21,59 @@ from pyspark.sql import functions as F
 from gabs import storage, tables
 from gabs.spark import get_spark_session
 from vendas import pipeline as p
-from vendas.schema_tables import PEDIDOS
+from vendas.schema_tables import PEDIDOS, SCHEMA_ORIGEM_PEDIDOS
 
 
-def _caminho_landing(data_carga: str) -> str:
-    """Pasta da carga do dia na landing: s3a://landing/vendas/pedidos/dt_carga=AAAA-MM-DD"""
-    return f"{storage.path('landing', p.PRODUTO, p.TABELA_PEDIDOS)}/dt_carga={data_carga}"
+def _caminho_landing(dia: str) -> str:
+    """Pasta do dia na landing: s3a://landing/vendas/pedidos/dt_referencia=AAAA-MM-DD"""
+    return f"{storage.path('landing', p.PRODUTO, p.TABELA_PEDIDOS)}/dt_referencia={dia}"
 
 
-def extrair_landing(data_carga: str) -> None:
-    """Origem -> landing: copia a tabela do PostgreSQL, sem alterar nada, em JSON."""
+def _consulta_do_dia(dia: str) -> str:
+    """SQL que a origem executa: só os pedidos criados no dia [dia, dia + 1)."""
+    inicio = date.fromisoformat(dia)
+    fim = inicio + timedelta(days=1)
+    return (
+        f"(SELECT * FROM {p.TABELA_ORIGEM} "
+        f"WHERE {p.COLUNA_DATA_ORIGEM} >= '{inicio.isoformat()}' "
+        f"AND {p.COLUNA_DATA_ORIGEM} < '{fim.isoformat()}') AS pedidos_do_dia"
+    )
+
+
+def extrair_landing(dia: str) -> None:
+    """Origem -> landing: os pedidos do dia, sem alterar nada, em JSON."""
     spark = get_spark_session(f"{p.PRODUTO}_landing")
     try:
         df = (
             spark.read.format("jdbc")
             .option("url", os.environ["FONTE_JDBC_URL"])
-            .option("dbtable", p.TABELA_ORIGEM)
+            # Em vez do nome da tabela, uma subconsulta: o filtro roda no
+            # PostgreSQL, e só os pedidos do dia trafegam pela rede.
+            .option("dbtable", _consulta_do_dia(dia))
             .option("user", os.environ["FONTE_USER"])
             .option("password", os.environ["FONTE_PASSWORD"])
             .option("driver", "org.postgresql.Driver")
             .load()
         )
-        df.write.mode("overwrite").json(_caminho_landing(data_carga))
+        df.write.mode("overwrite").json(_caminho_landing(dia))
     finally:
         spark.stop()
 
 
-def carregar_bronze(data_carga: str) -> None:
-    """Landing -> bronze: mesmos dados, agora em tabela Delta, com data da carga."""
+def carregar_bronze(dia: str) -> None:
+    """Landing -> bronze: os mesmos dados, em Delta, com o dia de referência."""
     spark = get_spark_session(f"{p.PRODUTO}_bronze")
     try:
         df = (
-            spark.read.json(_caminho_landing(data_carga))
-            .withColumn("DT_CARGA", F.lit(data_carga).cast("date"))
+            spark.read.schema(SCHEMA_ORIGEM_PEDIDOS).json(_caminho_landing(dia))
+            .withColumn(p.COLUNA_REFERENCIA, F.lit(dia).cast("date"))
             .withColumn("DH_PROCESSAMENTO", F.current_timestamp())
         )
-        tables.write_table(df, "bronze", p.PRODUTO, p.TABELA_PEDIDOS)
+        tables.write_table(
+            df, "bronze", p.PRODUTO, p.TABELA_PEDIDOS,
+            replace_where=f"{p.COLUNA_REFERENCIA} = '{dia}'",
+            partition_by=[p.COLUNA_REFERENCIA],
+        )
     finally:
         spark.stop()
 
@@ -61,19 +85,26 @@ def padronizar_pedidos(df: DataFrame) -> DataFrame:
         for origem, (destino, tipo) in PEDIDOS.items()
     ]
     return (
-        df.select(*colunas)
+        df.select(*colunas, p.COLUNA_REFERENCIA)
         .withColumn("SG_UF", F.upper(F.trim("SG_UF")))
         .withColumn("DS_STATUS", F.lower(F.trim("DS_STATUS")))
         .dropDuplicates(["ID_PEDIDO"])
     )
 
 
-def tratar_silver() -> None:
-    """Bronze -> silver: renomeia, tipa, padroniza textos e remove duplicatas."""
+def tratar_silver(dia: str) -> None:
+    """Bronze -> silver: renomeia, tipa, padroniza textos e remove duplicatas do dia."""
     spark = get_spark_session(f"{p.PRODUTO}_silver")
     try:
-        bronze = tables.read_table(spark, "bronze", p.PRODUTO, p.TABELA_PEDIDOS)
-        tables.write_table(padronizar_pedidos(bronze), "silver", p.PRODUTO, p.TABELA_PEDIDOS)
+        bronze = (
+            tables.read_table(spark, "bronze", p.PRODUTO, p.TABELA_PEDIDOS)
+            .filter(F.col(p.COLUNA_REFERENCIA) == F.lit(dia).cast("date"))
+        )
+        tables.write_table(
+            padronizar_pedidos(bronze), "silver", p.PRODUTO, p.TABELA_PEDIDOS,
+            replace_where=f"{p.COLUNA_REFERENCIA} = '{dia}'",
+            partition_by=[p.COLUNA_REFERENCIA],
+        )
     finally:
         spark.stop()
 
@@ -91,11 +122,34 @@ def resumir_por_dia(df: DataFrame) -> DataFrame:
     )
 
 
-def gerar_gold() -> None:
-    """Silver -> gold: tabela pronta para o BI."""
+def gerar_gold(dia: str) -> None:
+    """Silver -> gold: resumo do dia, pronto para o BI."""
     spark = get_spark_session(f"{p.PRODUTO}_gold")
     try:
-        silver = tables.read_table(spark, "silver", p.PRODUTO, p.TABELA_PEDIDOS)
-        tables.write_table(resumir_por_dia(silver), "gold", p.PRODUTO, p.TABELA_RESUMO_DIARIO)
+        silver = (
+            tables.read_table(spark, "silver", p.PRODUTO, p.TABELA_PEDIDOS)
+            .filter(F.col(p.COLUNA_REFERENCIA) == F.lit(dia).cast("date"))
+        )
+        tables.write_table(
+            resumir_por_dia(silver), "gold", p.PRODUTO, p.TABELA_RESUMO_DIARIO,
+            replace_where=f"DT_PEDIDO = '{dia}'",
+            partition_by=["DT_PEDIDO"],
+        )
+    finally:
+        spark.stop()
+
+
+def resetar_produto() -> None:
+    """Apaga as tabelas e os arquivos do produto em todas as camadas.
+
+    Uso único, ao migrar da versão de carga completa para a incremental, já
+    que a estrutura das tabelas mudou. Não existe desfazer.
+    """
+    spark = get_spark_session(f"{p.PRODUTO}_reset")
+    try:
+        tables.drop_table(spark, "bronze", p.PRODUTO, p.TABELA_PEDIDOS)
+        tables.drop_table(spark, "silver", p.PRODUTO, p.TABELA_PEDIDOS)
+        tables.drop_table(spark, "gold", p.PRODUTO, p.TABELA_RESUMO_DIARIO)
+        tables.delete_path(spark, storage.path("landing", p.PRODUTO, p.TABELA_PEDIDOS))
     finally:
         spark.stop()

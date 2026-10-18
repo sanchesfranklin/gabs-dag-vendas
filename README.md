@@ -1,13 +1,14 @@
 # Produto: vendas
 
 Pipeline de pedidos do Gabs Data Framework, da origem até a camada gold.
+Incremental e idempotente: cada execução processa um dia de pedidos e substitui só a fatia daquele dia.
 
 | Etapa | Origem | Destino |
 |---|---|---|
-| landing | PostgreSQL `fonte.vendas.pedidos` | `s3a://landing/vendas/pedidos/dt_carga=AAAA-MM-DD/` (JSON) |
-| bronze | landing | `bronze.vendas_pedidos` (Delta) |
-| silver | bronze | `silver.vendas_pedidos` (Delta, colunas padronizadas, sem duplicatas) |
-| gold | silver | `gold.vendas_resumo_diario` (Delta, pedidos pagos por dia e UF) |
+| landing | PostgreSQL `fonte.vendas.pedidos` | `s3a://landing/vendas/pedidos/dt_referencia=AAAA-MM-DD/` (JSON, só os pedidos do dia) |
+| bronze | landing | `bronze.vendas_pedidos` (Delta, partição `DT_REFERENCIA`) |
+| silver | bronze | `silver.vendas_pedidos` (Delta, partição `DT_REFERENCIA`, colunas padronizadas, sem duplicatas) |
+| gold | silver | `gold.vendas_resumo_diario` (Delta, partição `DT_PEDIDO`, pedidos pagos por dia e UF) |
 
 ## Arquivos
 
