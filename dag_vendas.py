@@ -20,7 +20,6 @@ FUSO = "America/Sao_Paulo"
     start_date=pendulum.datetime(2026, 9, 1, tz=FUSO),
     catchup=False,
     max_active_runs=1,
-    # Uma tarefa por vez: cada uma abre um Spark, e a máquina tem 8 GB.
     max_active_tasks=1,
     tags=["vendas", "lakehouse"],
 )

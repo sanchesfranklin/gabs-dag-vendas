@@ -21,7 +21,7 @@ from pyspark.sql import functions as F
 from gabs import storage, tables
 from gabs.spark import get_spark_session
 from vendas import pipeline as p
-from vendas.schema_tables import PEDIDOS, SCHEMA_ORIGEM_PEDIDOS
+from vendas.schema_tables import PEDIDOS, SCHEMA_ORIGEM_PEDIDOS, SCHEMA_SILVER_PEDIDOS
 
 
 def _caminho_landing(dia: str) -> str:
@@ -82,7 +82,7 @@ def padronizar_pedidos(df: DataFrame) -> DataFrame:
     """Regras da silver, separadas da leitura e da gravação para poderem ser testadas."""
     colunas = [
         F.col(origem).cast(tipo).alias(destino)
-        for origem, (destino, tipo) in PEDIDOS.items()
+        for origem, (destino,  tipo) in SCHEMA_SILVER_PEDIDOS.items()
     ]
     return (
         df.select(*colunas, p.COLUNA_REFERENCIA)

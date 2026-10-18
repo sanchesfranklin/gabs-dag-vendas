@@ -13,7 +13,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-PEDIDOS = {
+SCHEMA_SILVER_PEDIDOS = {
     "id_pedido": ("ID_PEDIDO", IntegerType()),
     "cliente": ("NM_CLIENTE", StringType()),
     "uf": ("SG_UF", StringType()),
@@ -26,5 +26,5 @@ PEDIDOS = {
 # explícito evita que o Spark "adivinhe" tipos diferentes a cada dia e permite
 # ler um dia sem pedidos (pasta sem dados) sem erro.
 SCHEMA_ORIGEM_PEDIDOS = StructType(
-    [StructField(origem, tipo) for origem, (_, tipo) in PEDIDOS.items()]
+    [StructField(origem, tipo) for origem, (_, tipo) in SCHEMA_SILVER_PEDIDOS.items()]
 )
