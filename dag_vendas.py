@@ -46,12 +46,14 @@ def vendas_pedidos():
 
     # short_circuit: se a função devolver False, as tarefas seguintes são
     # puladas (ficam "skipped", não "failed"). Com
-    # ignore_downstream_trigger_rules=False, só a próxima é pulada direto; as
-    # demais seguem a própria regra, o que permite à tarefa "fim" rodar mesmo
+    # ignore_downstream_trigger_rules=False, só a próxima é pulada direto, no caso a bronze; as
+    # demais seguem a própria regra padrão de all_sucess, o que permite à tarefa "fim" rodar mesmo
     # assim.
     @task.short_circuit(ignore_downstream_trigger_rules=False)
     def tem_pedidos(quantidade: int) -> bool:
         print(f"Pedidos no dia: {quantidade}")
+        if quantidade is None:
+            return False
         return quantidade > 0
 
     @task
