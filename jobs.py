@@ -21,7 +21,7 @@ from pyspark.sql import functions as F
 from gabs import storage, tables
 from gabs.spark import get_spark_session
 from vendas import pipeline as p
-from vendas.schema_tables import PEDIDOS, SCHEMA_ORIGEM_PEDIDOS, SCHEMA_SILVER_PEDIDOS
+from vendas.schema_tables import SCHEMA_ORIGEM_PEDIDOS, SCHEMA_SILVER_PEDIDOS
 
 
 def _caminho_landing(dia: str) -> str:
