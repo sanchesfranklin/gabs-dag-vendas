@@ -21,7 +21,7 @@ from pyspark.sql import functions as F
 from gabs import storage, tables
 from gabs.spark import get_spark_session
 from vendas import pipeline as p
-from vendas.schema_tables import SCHEMA_ORIGEM_PEDIDOS, SCHEMA_SILVER_PEDIDOS
+from vendas.schema_tables import PEDIDOS, SCHEMA_ORIGEM_PEDIDOS
 
 
 def _caminho_landing(dia: str) -> str:
@@ -40,8 +40,13 @@ def _consulta_do_dia(dia: str) -> str:
     )
 
 
-def extrair_landing(dia: str) -> None:
-    """Origem -> landing: os pedidos do dia, sem alterar nada, em JSON."""
+def extrair_landing(dia: str) -> int:
+    """Origem -> landing: os pedidos do dia, sem alterar nada, em JSON.
+
+    Devolve quantos pedidos vieram, para a DAG decidir se segue adiante.
+    Mesmo com zero pedidos a pasta do dia é gravada (vazia): fica registrado
+    que a coleta aconteceu e não encontrou nada.
+    """
     spark = get_spark_session(f"{p.PRODUTO}_landing")
     try:
         df = (
@@ -55,7 +60,10 @@ def extrair_landing(dia: str) -> None:
             .option("driver", "org.postgresql.Driver")
             .load()
         )
+        df.cache()  # a origem é lida uma vez só, para contar e para gravar
+        quantidade = df.count()
         df.write.mode("overwrite").json(_caminho_landing(dia))
+        return quantidade
     finally:
         spark.stop()
 
@@ -82,7 +90,7 @@ def padronizar_pedidos(df: DataFrame) -> DataFrame:
     """Regras da silver, separadas da leitura e da gravação para poderem ser testadas."""
     colunas = [
         F.col(origem).cast(tipo).alias(destino)
-        for origem, (destino,  tipo) in SCHEMA_SILVER_PEDIDOS.items()
+        for origem, (destino, tipo) in PEDIDOS.items()
     ]
     return (
         df.select(*colunas, p.COLUNA_REFERENCIA)
