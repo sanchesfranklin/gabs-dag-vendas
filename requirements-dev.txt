@@ -1,0 +1,8 @@
+# Dependências para rodar os testes fora do contêiner do Airflow.
+# O PySpark segue a versão do docker-compose (x-spark-build-args), e o Python
+# deve ser o mesmo do contêiner (3.11).
+pyspark==3.5.6
+delta-spark==3.3.2
+pytest
+# Base de fusos horários para o zoneinfo no Windows (no Linux vem do sistema)
+tzdata

@@ -2,18 +2,20 @@
 
 A primeira execução traz todo o histórico (carga completa). As seguintes
 trazem só o dia do intervalo de dados da execução (carga incremental).
-O arquivo só DESCREVE o fluxo; o trabalho pesado fica em jobs.py, importado
-dentro de cada tarefa, para o Airflow não carregar o Spark só para ler a DAG.
+
+O arquivo só DESCREVE o fluxo: as tarefas, a ordem e o que cada uma passa
+para a próxima. O que cada tarefa executa está em vendas/tarefas.py.
 """
 
 import pendulum
 from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.sdk import CronDataIntervalTimetable, Param, dag, task
+from airflow.providers.standard.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.sdk import DAG, CronDataIntervalTimetable, Param
 
-FUSO = "America/Sao_Paulo"
+from vendas import tarefas
+from vendas.config import FUSO, PRODUTO
 
-
-@dag(
+with DAG(
     dag_id="vendas_pedidos",
     # Intervalos diários de meia-noite a meia-noite, no fuso de Brasília. A
     # execução que roda em 18/10 à 0h cobre o intervalo [17/10, 18/10), e a
@@ -22,9 +24,9 @@ FUSO = "America/Sao_Paulo"
     start_date=pendulum.datetime(2026, 9, 1, tz=FUSO),
     catchup=False,
     max_active_runs=1,
-    # Uma tarefa por vez: cada uma abre um Spark, e a máquina tem 8 GB.
     max_active_tasks=1,
-    # Aparece como formulário no "Trigger" da tela do Airflow.
+    # Aparece como formulário no "Trigger" da tela do Airflow
+    # se quiser uma execução completa basta marcar o campo e disparar.
     params={
         "carga_completa": Param(
             False,
@@ -36,70 +38,57 @@ FUSO = "America/Sao_Paulo"
             ),
         ),
     },
-    tags=["vendas", "lakehouse"],
-)
-def vendas_pedidos():
+    tags=[PRODUTO, "lakehouse"],
+) as dag:
 
-    @task
-    def definir_janela(**context) -> dict:
-        """Converte o intervalo da execução em datas (AAAA-MM-DD) no fuso de Brasília."""
-        inicio = context["data_interval_start"]
-        fim = context["data_interval_end"]
-        if inicio is None or fim is None:
-            raise ValueError(
-                "Execução sem intervalo de dados. Dispare com uma data lógica "
-                "(Trigger com data) ou use backfill."
-            )
-        return {
-            "inicio": inicio.in_timezone(FUSO).date().isoformat(),
-            "fim": fim.in_timezone(FUSO).date().isoformat(),
-            "carga_completa": bool(context["params"]["carga_completa"]),
-        }
+    definir_janela = PythonOperator(
+        task_id="definir_janela",
+        python_callable=tarefas.definir_janela,
+    )
 
-    @task
-    def landing(janela: dict) -> dict:
-        """Extrai a janela e devolve a janela EFETIVA (sem início, se a carga foi completa)."""
-        from vendas.jobs import extrair_landing
+    # .output é o retorno da tarefa (XCom), entregue à função como dict. Com
+    # um template "{{ ti.xcom_pull(...) }}" chegaria como texto.
+    landing = PythonOperator(
+        task_id="landing",
+        python_callable=tarefas.extrair_landing,
+        op_kwargs={"janela": definir_janela.output},
+    )
 
-        return extrair_landing(janela["inicio"], janela["fim"], janela["carga_completa"])
+    # Se a função devolver False, as tarefas seguintes são puladas (ficam
+    # "skipped", não "failed"). Com ignore_downstream_trigger_rules=False, só
+    # a próxima é pulada direto; as demais seguem a própria regra, o que
+    # permite à tarefa "fim" rodar mesmo assim.
+    tem_pedidos = ShortCircuitOperator(
+        task_id="tem_pedidos",
+        python_callable=tarefas.tem_pedidos,
+        op_kwargs={"carga": landing.output},
+        ignore_downstream_trigger_rules=False,
+    )
 
-    # short_circuit: se a função devolver False, as tarefas seguintes são
-    # puladas (ficam "skipped", não "failed"). Com
-    # ignore_downstream_trigger_rules=False, só a próxima é pulada direto; as
-    # demais seguem a própria regra, o que permite à tarefa "fim" rodar mesmo
-    # assim.
-    @task.short_circuit(ignore_downstream_trigger_rules=False)
-    def tem_pedidos(carga: dict) -> bool:
-        print(f"Pedidos na janela: {carga['quantidade']}")
-        return carga["quantidade"] > 0
+    # A landing decide a janela (diária ou completa) e entrega a MESMA janela
+    # a todas as camadas.
+    bronze = PythonOperator(
+        task_id="bronze",
+        python_callable=tarefas.carregar_bronze,
+        op_kwargs={"carga": landing.output},
+    )
 
-    @task
-    def bronze(carga: dict) -> None:
-        from vendas.jobs import carregar_bronze
+    silver = PythonOperator(
+        task_id="silver",
+        python_callable=tarefas.tratar_silver,
+        op_kwargs={"carga": landing.output},
+    )
 
-        carregar_bronze(carga["inicio"], carga["fim"])
-
-    @task
-    def silver(carga: dict) -> None:
-        from vendas.jobs import tratar_silver
-
-        tratar_silver(carga["inicio"], carga["fim"])
-
-    @task
-    def gold(carga: dict) -> None:
-        from vendas.jobs import gerar_gold
-
-        gerar_gold(carga["inicio"], carga["fim"])
+    gold = PythonOperator(
+        task_id="gold",
+        python_callable=tarefas.gerar_gold,
+        op_kwargs={"carga": landing.output},
+    )
 
     # Marca o fim da execução, com ou sem pedidos. "none_failed" faz ela rodar
     # quando as anteriores terminaram bem OU foram puladas, e não rodar se
     # alguma falhou.
     fim = EmptyOperator(task_id="fim", trigger_rule="none_failed")
 
-    # A landing decide a janela (diária ou completa) e entrega a MESMA janela,
-    # via XCom, a todas as etapas seguintes.
-    carga = landing(definir_janela())
-    tem_pedidos(carga) >> bronze(carga) >> silver(carga) >> gold(carga) >> fim
-
-
-vendas_pedidos()
+    # O .output já liga cada camada à landing; a ordem completa fica explícita aqui.
+    definir_janela >> landing >> tem_pedidos >> bronze >> silver >> gold >> fim

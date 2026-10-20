@@ -1,4 +1,9 @@
-# Arquivos deste produto que NÃO são DAGs (o Airflow não precisa analisá-los)
-jobs.py
-pipeline.py
-schema_tables.py
+# Só dag_vendas.py é DAG. O resto é código importado pelas tarefas, ou
+# testes, e o Airflow não precisa analisá-lo à procura de DAGs.
+config.py
+janela.py
+schemas.py
+tarefas.py
+conectores/
+jobs/
+tests/
